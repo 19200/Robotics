@@ -158,17 +158,43 @@ class ImageSubscriber(Node):
                 
                 h, w = self.dimage.shape[:2]
                 if 0 <= cx < w and 0 <= cy < h:
-                    depth_value = self.dimage[cy, cx]
-                    depths.append(depth_value)
+                    depth_value = float(self.dimage[cy, cx])
                 else:
+                    depth_value = 0.0   # treat out-of-range as invalid depth
+
+                if depth_value > 10.0:
+                    depth_value = depth_value / 1000.0
+
+
+                if depth_value <= 0 or depth_value > 3.0 or math.isnan(depth_value) or math.isinf(depth_value):
+
                     depths.append(None)
+                else:
+                    depths.append(depth_value)
         
         result = cv2.bitwise_and(current_frame, current_frame, mask=mask_clean)
 
         if not centroids or not depths:
             print("no centroids or depths")
             return None
-        
+        # ---- FILTER OUT POINTS WITH INVALID DEPTH ----
+        valid_centroids = []
+        valid_depths = []
+
+        for c, d in zip(centroids, depths):
+            if d is not None and d > 0:
+                valid_centroids.append(c)
+                valid_depths.append(d)
+
+        # Replace lists with filtered versions
+        centroids = valid_centroids
+        depths = valid_depths
+
+        # If nothing left → no valid detections
+        if len(centroids) == 0:
+            print("No valid centroid-depth pairs → skipping frame")
+            return None
+
         if self.ins is None:
             return None
 

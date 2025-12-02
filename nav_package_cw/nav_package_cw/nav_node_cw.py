@@ -14,7 +14,7 @@ from visualization_msgs.msg import Marker
 from rclpy.duration import Duration
 from rclpy.qos import qos_profile_sensor_data
 import math
-
+import numpy as np
 class NavigateToPoseActionClient(Node):
     MOVE,SCAN,OBJECT,AVOID,DONE,TURNTO = range(6)
     def __init__(self):
@@ -48,9 +48,14 @@ class NavigateToPoseActionClient(Node):
             10
         )
         
-        self.state = self.MOVE 
+        self.state = self.SCAN
         self.timer_period = 0.5  # seconds
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
+
+        self.timer_period_stuck = 10.0
+        self.prev_pos = None # seconds
+        self.stuck_distance_threshold = 0.2 
+        self.timer_stuck = self.create_timer(self.timer_period_stuck, self.timer_callback_stuck)
         self.ranges = []
         self.subscription
         self.scan_points = [] # could be, maybe, idk chat (2.4, 0.0), (1.41, -3.41), (-0.47, -0.57), (-1.59, -3.03), (-1.58, 2.98), (1.01, 3.99),
@@ -105,6 +110,50 @@ class NavigateToPoseActionClient(Node):
 
         return roll, pitch, yaw
 
+    def timer_callback_stuck(self):
+        # Get robot position
+
+        if self.state == self.SCAN or self.state == self.TURNTO: return
+        x, y, yaw = self.get_robot_pose()
+
+        if x is None:  # failed to get pose
+            return
+
+        if self.prev_pos is None:
+            # First time storing pose
+            self.prev_pos = (x, y)
+            return
+
+        px, py = self.prev_pos
+
+        # Euclidean distance moved since last check
+        dist = np.hypot(x - px, y - py)
+
+        # Debug print
+        self.get_logger().info(f"[STUCK CHECK] Moved: {dist:.3f} m")
+
+        # If robot moved less than threshold → it's stuck
+        if dist < self.stuck_distance_threshold:
+            self.get_logger().warn("Robot appears STUCK → Canceling current goal!")
+
+            try:
+                if self.state == self.MOVE:
+                    # cancel the goal (assuming you have nav2 action client named self.nav_client)
+                    self.cancel_navigation()
+                    if self.scan_points:
+                        self.is_navigating = False
+                        self.scan_points.pop(0)
+                elif self.state == self.OBJECT:
+                    self.cancel_navigation()
+                    self.is_navigating = False
+                    self.state = self.TURNTO
+            except Exception as e:
+                self.get_logger().error(f"Failed to cancel goal: {e}")
+
+        # Update for next cycle
+        self.prev_pos = (x, y)
+
+
     def get_robot_pose(self):
         try:
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
@@ -130,8 +179,10 @@ class NavigateToPoseActionClient(Node):
         pose.pose.position.y = y
         pose.pose.position.z = 0.0
 
+        pose.pose.orientation.w = 1.0  # Neutral orientation (no rotation)
+        pose.pose.orientation.x = 0.0
+        pose.pose.orientation.y = 0.0
         pose.pose.orientation.z = 0.0
-        pose.pose.orientation.w = 1.0
 
         self.get_logger().info("CHECK 54 :-)")
         
@@ -139,7 +190,7 @@ class NavigateToPoseActionClient(Node):
         goal_msg.pose = pose
         goal_msg.behavior_tree = ''
         self.get_logger().info('point %f %f' % (x, y))
-
+        self.publish_marker(x,y,0.0)
         send_goal_future = self._action_client.send_goal_async(
             goal_msg,
             feedback_callback=self.feedback_callback
@@ -191,7 +242,7 @@ class NavigateToPoseActionClient(Node):
         except Exception as e:
             self.get_logger().error(f"Error while cancelling goal: {e}")
 
-        # Reset navigation state
+
         self.is_navigating = False
         
         self.current_goal_handle = None
@@ -322,7 +373,7 @@ class NavigateToPoseActionClient(Node):
                 # Check if within 5cm of goal - consider it reached
                 if (
                     self.distance_remaining is not None and 
-                    self.distance_remaining <= 0.1
+                    self.distance_remaining <= 0.3
                 ):
                     self.get_logger().info("Within 5cm of MOVE goal → reached destination")
                     self.cancel_navigation()
@@ -383,7 +434,8 @@ class NavigateToPoseActionClient(Node):
                 self.stop(msg)
                 self.state = self.MOVE
                 self.turn_counter = 0
-                self.scan_points.pop(0) 
+                if self.scan_points:
+                    self.scan_points.pop(0) 
                 return
 
             if len(self.go_to_points) > 0:
