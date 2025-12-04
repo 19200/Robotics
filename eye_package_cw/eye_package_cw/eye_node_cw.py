@@ -98,7 +98,8 @@ class ImageSubscriber(Node):
         try:
             tf = self.tf_buffer.lookup_transform(to_frame, from_frame, now, timeout=rclpy.duration.Duration(seconds=1.0))
             return tf
-        except:
+        except Exception as e:
+            self.get_logger().error(f"Failed to get transformation: {e}")
             return None
         
     def image_callback(self, data):
@@ -177,7 +178,7 @@ class ImageSubscriber(Node):
         if not centroids or not depths:
             print("no centroids or depths")
             return None
-        # ---- FILTER OUT POINTS WITH INVALID DEPTH ----
+
         valid_centroids = []
         valid_depths = []
 
@@ -219,7 +220,7 @@ class ImageSubscriber(Node):
         point.point.x = points_3d[0][0]
         point.point.y = points_3d[0][1]
         point.point.z = points_3d[0][2]
-        # ---- VALIDATE 3D POINT ----
+
         X, Y, Z = points_3d[0]
 
         # Reject invalid numbers
@@ -242,8 +243,8 @@ class ImageSubscriber(Node):
         for px, py in self.go_to_points:
             dist = math.hypot(px - x, py - y)
             if dist < min_distance:
-                return False   # too close → reject
-        return True            # far from all → accept
+                return False   # too close = reject
+        return True            # far from all = accept
 
     def timer_callback(self):
 
@@ -256,7 +257,9 @@ class ImageSubscriber(Node):
 
         if not isinstance(self.dimage, np.ndarray) or self.dimage.size == 0:
             return
+        
         current_frame = self.image
+        
         if current_frame == []:
             return
 
@@ -311,3 +314,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+    

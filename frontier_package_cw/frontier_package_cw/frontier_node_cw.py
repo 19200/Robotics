@@ -1,25 +1,29 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
+from nav2_msgs.action import ComputePathToPose
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PointStamped
 from map_msgs.msg import OccupancyGridUpdate
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from geometry_msgs.msg import PoseStamped
 
 import numpy as np
 import cv2
 
-
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
+        self.client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
 
         # QoS for reliable map delivery
         map_qos = QoSProfile(
             depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL
+            reliability=ReliabilityPolicy.RELIABLE, # keep calling util we get enough data (full map)
+            durability=DurabilityPolicy.TRANSIENT_LOCAL # late joining subscriptions - ensure late data is added correctly
         )
 
+        # A grid of the map
         self.map_sub = self.create_subscription(
             OccupancyGrid,
             '/map',
@@ -27,6 +31,7 @@ class FrontierExplorer(Node):
             map_qos
         )
 
+        # Updates the map grid to say what data is inside each cell
         self.map_update_sub = self.create_subscription(
             OccupancyGridUpdate,
             '/map_updates',
@@ -49,11 +54,11 @@ class FrontierExplorer(Node):
 
         self.latest_map_msg = None
         self.frontiers = []
-        self.padding_radius = 7
         self.visited_goals = []
         self.visited_frontiers = []
-
-        self.goal_distance_threshold = 3.0
+        
+        self.goal_distance_threshold = 1.0
+ 
         self.map_resolution = None
         self.map_origin_x = None
         self.map_origin_y = None
@@ -66,11 +71,48 @@ class FrontierExplorer(Node):
         self.map_origin_x = map_msg.info.origin.position.x
         self.map_origin_y = map_msg.info.origin.position.y
 
-        grid = np.array(map_msg.data).reshape((map_msg.info.height, map_msg.info.width))
-        self.frontiers = self.find_frontiers(grid)
+        grid = np.array(map_msg.data).reshape((map_msg.info.height, map_msg.info.width)) # reshapes map when more points are discovered
+        self.frontiers = self.find_frontiers(grid) # includes frontiers
         self.visualize_map(grid)
+        
+    def compute_path(self, x, y, yaw=0.0):
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = "map"
+        goal_pose.pose.position.x = x
+        goal_pose.pose.position.y = y
+        goal_pose.pose.orientation.w = 1.0 
 
+        goal_msg = ComputePathToPose.Goal()
+        goal_msg.goal = goal_pose
+        goal_msg.use_start = False
 
+        self.get_logger().info("We are now waiting for the server in compute path")
+        
+        self.client.wait_for_server()
+
+        self.get_logger().info("Sending goal")
+        
+        return self.is_goal_reachable(goal_msg)
+
+    def is_goal_reachable(self, goal_msg):
+        goal_future = self.client.send_goal_async(goal_msg)
+        rclpy.spin_until_future_complete(self, goal_future)
+        goal_handle = goal_future.result()
+
+        if not goal_handle or not goal_handle.accepted:
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        result = result_future.result()
+
+        if result is None:
+            return False
+
+        if len(result.result.path.poses) == 0:
+            return False
+
+        return True
 
     def map_update_callback(self, upd):
         if self.latest_map_msg is None:
@@ -81,21 +123,20 @@ class FrontierExplorer(Node):
 
         for row in range(upd.height):
             for col in range(upd.width):
-                map_index = (upd.y + row) * w + (upd.x + col)
+                map_index = (upd.y + row) * w + (upd.x + col) # what is this doing? - is this just putting the 0, 1, -1 into the correct place when the map grows in size?
                 upd_index = row * upd.width + col
                 self.latest_map_msg.data[map_index] = upd.data[upd_index]
 
-        grid = np.array(self.latest_map_msg.data).reshape((h, w))
+        grid = np.array(self.latest_map_msg.data).reshape((h, w)) # If so, what is the point in this?
         self.frontiers = self.find_frontiers(grid)
         self.visualize_map(grid)
-
 
     def find_frontiers(self, grid):
         h, w = grid.shape
         frontiers = []
 
-        # Treat -1 AND midpoints (50) as unknown
-        unknown_mask = (grid < 0) | (grid == 50)
+        # Treat -1 as unknown
+        unknown_mask = grid < 0
 
         for y in range(1, h - 1):
             for x in range(1, w - 1):
@@ -103,45 +144,39 @@ class FrontierExplorer(Node):
                 # Only free space
                 if grid[y, x] != 0:
                     continue
-
-                neigh = grid[y-1:y+2, x-1:x+2]
-
-                # If any neighbor is unknown → frontier
-                if np.any(unknown_mask[y-1:y+2, x-1:x+2]):
-                    frontiers.append((x, y))
+                
+                # If any neighbor is unknown = frontier
+                if np.any(unknown_mask[y-2:y+2, x-2:x+2]):
+                    if all((fx - x)**2 + (fy - y)**2 > 9 for fx, fy in frontiers): # Prevents frontiers from being duplicated, ensures a single line
+                        frontiers.append((x, y))
 
         return frontiers
 
-
-
-    def has_neighbor(self, grid, x, y, value):
-        neighbors = grid[y-1:y+2, x-1:x+2].flatten()
-        return value in neighbors
+    # Nuked has has_neigbor because it's never used 
+    
+    def idx(self, x, y, width):
+        return y * width + x
 
     def compute_frontier_scores(self,map_data, frontiers, kernel_size=15):
         scores = []
         radius = kernel_size // 2
         width = map_data.info.width
         height = map_data.info.height
-        occ = list(map_data.data)  # occupancy grid (flat list)
-
-        def idx(x, y):
-            return y * width + x
+        occ = list(map_data.data)  # occupancy grid is the current grid
 
         for (x, y) in frontiers:
             score = 0
             # scan kernel around frontier
-            for dy in range(-radius, radius+1):
-                for dx in range(-radius, radius+1):
-                    nx = x + dx
-                    ny = y + dy
-                    if 0 <= nx < width and 0 <= ny < height:
-                        if occ[idx(nx, ny)] == -1:   # unknown
-                            score += 1
+            for dy in range(-radius, radius+1): 
+                for dx in range(-radius, radius+1): # for the circle around our current point we get
+                    nx = x + dx # x of the point
+                    ny = y + dy # y of the point
+                    if 0 <= nx < width and 0 <= ny < height: # Make sure it's within the maps boundaries
+                        if occ[self.idx(nx, ny, width)] == -1:   # Is the point on the grid -1
+                            score += 1 # If it is the score is increased, increasing it's priority
             scores.append(score)
 
         return scores
-
 
     def point_callback(self, point_msg):
         if self.latest_map_msg is None:
@@ -150,97 +185,82 @@ class FrontierExplorer(Node):
 
         robot_x = point_msg.point.x
         robot_y = point_msg.point.y
-        mx, my = self.world_to_map(robot_x, robot_y, self.latest_map_msg)
+        
+        mx, my = self.world_to_map(robot_x, robot_y, self.latest_map_msg) # Robots x and y based in grid co-ordinates
 
         if not self.frontiers:
-            self.get_logger().warn("No valid frontiers!")
+            self.get_logger().warn("No valid frontiers!") # All frontiers are currently found
             return
 
-        fx, fy = self.select_frontier(mx, my)
-        wx, wy = self.map_to_world(fx, fy, self.latest_map_msg)
+        fx, fy = self.select_frontier(mx, my) # Get the frontiers co-ordinates based on the robots current position, best frontier to go to based on said values
+        wx, wy = self.map_to_world(fx, fy, self.latest_map_msg) # Converting fx and fy from map to world based co-ordinates
 
         goal = PointStamped()
         goal.header.frame_id = "map"
         goal.header.stamp = self.get_clock().now().to_msg()
-        goal.point.x = float(wx)
-        goal.point.y = float(wy)
-        self.get_logger().info(f"Selected viable frontier: ({fx}, {fy}) → ({wx:.2f}, {wy:.2f})")
+        goal.point.x = float(wx) # Attaching x
+        goal.point.y = float(wy) # Attaching y
+        self.get_logger().info(f"Selected viable frontier: ({fx}, {fy}) = ({wx:.2f}, {wy:.2f})")
 
         self.get_logger().info(f"Publishing frontier: ({wx:.2f}, {wy:.2f})")
-        self.frontier_pub.publish(goal)
-
+        self.frontier_pub.publish(goal) # Publish frontier position
 
     def select_frontier(self, mx, my):
-        if not self.frontiers:
+        if not self.frontiers: # If there's no frontiers return
             return None
 
         map_msg = self.latest_map_msg
         viable = []
 
-        # Build list of viable frontiers
-        for fx, fy in self.frontiers:
-            # Convert frontier to world coords
-            wx, wy = self.map_to_world(fx, fy, map_msg)
-
-            # WORLD coordinates of robot
-            robot_wx, robot_wy = self.map_to_world(mx, my, map_msg)
-
-            # WORLD-SPACE FILTERING
-            if any(np.hypot(wx - vx, wy - vy) < self.goal_distance_threshold
-                for vx, vy in self.visited_goals):
+        for fx, fy in self.frontiers: # For every co-ordinate in frontiers
+            
+            wx, wy = self.map_to_world(fx, fy, map_msg) # Get there real world values
+            robot_wx, robot_wy = self.map_to_world(mx, my, map_msg) # Along with the robots
+            
+            if any(np.hypot(wx - vx, wy - vy) < self.goal_distance_threshold for vx, vy in self.visited_goals): # For evert goal it's visited get it's hypo from itself to the goal. 
                 continue
+            
+            dist = np.hypot(wx - robot_wx, wy - robot_wy) # Calculate it's distance from the point to the robot
 
-            # WORLD-SPACE DISTANCE for scoring
-            dist = np.hypot(wx - robot_wx, wy - robot_wy)
-
-            viable.append((fx, fy, wx, wy, dist))
-
+            viable.append((fx, fy, wx, wy, dist)) # Create a list which has all the valid points in it 
 
         if not viable:
             self.get_logger().warn("No viable frontiers — using fallback")
-            fx, fy = self.frontiers.pop(0)
+            fx, fy = self.frontiers.pop(0) # Change this code
             wx, wy = self.map_to_world(fx, fy, map_msg)
             self.visited_goals.append((wx, wy))
             return fx, fy
 
-        # Extract (fx,fy) list for scoring
         frontiers_xy = [(fx, fy) for (fx, fy, wx, wy, dist) in viable]
-
-        # UNKNOWN SCORE (raw)
         unknown_scores = self.compute_frontier_scores(map_msg, frontiers_xy)
-
-        # DISTANCE SCORE (raw)
         dists = [dist for (_, _, _, _, dist) in viable]
-
-        # Normalize both
         min_u, max_u = min(unknown_scores), max(unknown_scores)
         min_d, max_d = min(dists), max(dists)
 
-        unknown_norm = [(u - min_u) / (max_u - min_u + 1e-6) for u in unknown_scores]
+        unknown_norm = [(u - min_u) / (max_u - min_u + 1e-6) for u in unknown_scores] # 1e-6 needed to not divide by 0
         dist_norm = [1.0 - (d - min_d) / (max_d - min_d + 1e-6) for d in dists]
-
-        # WEIGHTS → tune these:
-        W_unknown = 0.7
-        W_distance = 0.3
+        
+        W_unknown = 0.6 # weighted towards unknown
+        W_distance = 0.4 # more than distances
 
         combined = [
-            W_unknown * unknown_norm[i] + W_distance * dist_norm[i]
+            W_unknown * unknown_norm[i] - W_distance * dist_norm[i]
             for i in range(len(viable))
         ]
 
         best_idx = int(np.argmax(combined))
 
         fx, fy, wx, wy, dist = viable[best_idx]
+        
+        #if not (self.compute_path(wx, wy)):
+        #    self.get_logger().info("######## Can't compute path ########")
+        
         if (fx, fy) in self.frontiers:
             self.frontiers.remove((fx, fy))
-
-        # Mark visited
-        self.visited_frontiers.append((fx, fy))   # map grid coords
+            
+        self.visited_frontiers.append((fx, fy))  
         self.visited_goals.append((wx, wy)) 
         return fx, fy
-
-
-
 
     def world_to_map(self, wx, wy, map_msg):
         res = map_msg.info.resolution
@@ -257,7 +277,7 @@ class FrontierExplorer(Node):
         wx = x_idx * res + origin.position.x + res / 2.0
         wy = y_idx * res + origin.position.y + res / 2.0
         return wx, wy
-
+    
 
     def visualize_map(self, grid):
         img = np.zeros((grid.shape[0], grid.shape[1], 3), dtype=np.uint8)
@@ -289,7 +309,6 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
