@@ -56,7 +56,7 @@ class FrontierExplorer(Node):
         self.frontiers = []
         self.visited_goals = []
         self.visited_frontiers = []
-        
+        self.ring_points =  []
         self.goal_distance_threshold = 1.0
  
         self.map_resolution = None
@@ -73,27 +73,71 @@ class FrontierExplorer(Node):
 
         grid = np.array(map_msg.data).reshape((map_msg.info.height, map_msg.info.width)) # reshapes map when more points are discovered
         self.frontiers = self.find_frontiers(grid) # includes frontiers
+        self.ring_points = self._calculate_safety_ring_points(grid, map_msg)
         self.visualize_map(grid)
         
-    def compute_path(self, x, y, yaw=0.0):
-        goal_pose = PoseStamped()
-        goal_pose.header.frame_id = "map"
-        goal_pose.pose.position.x = x
-        goal_pose.pose.position.y = y
-        goal_pose.pose.orientation.w = 1.0 
+ 
 
-        goal_msg = ComputePathToPose.Goal()
-        goal_msg.goal = goal_pose
-        goal_msg.use_start = False
-
-        self.get_logger().info("We are now waiting for the server in compute path")
+    def _calculate_safety_ring_points(self, grid, map_info):
+ 
+        h, w = grid.shape
         
-        self.client.wait_for_server()
-
-        self.get_logger().info("Sending goal")
+        obstacle_radius = 6 
         
-        return self.is_goal_reachable(goal_msg)
+        initial_obstacle_binary = np.zeros((h, w), dtype=np.uint8)
+        initial_obstacle_binary[grid != 0] = 255 
+        
+        kernel_obs = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (obstacle_radius * 2 + 1, obstacle_radius * 2 + 1))
+        
+        dilated_obstacle_map = cv2.dilate(initial_obstacle_binary, kernel_obs, iterations=1)
 
+        raw_boundary_points = []
+        
+        for y in range(1, h - 1):
+            for x in range(1, w - 1):
+                
+                if dilated_obstacle_map[y, x] == 0: 
+                    
+                    is_adjacent_to_dilated_obstacle = False
+                    
+                    for dy, dx in [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]:
+                        ny, nx = y + dy, x + dx
+                        
+                        if dilated_obstacle_map[ny, nx] == 255:
+                            is_adjacent_to_dilated_obstacle = True
+                            break 
+                    
+                    if is_adjacent_to_dilated_obstacle:
+                        raw_boundary_points.append((x, y))
+
+        boundary_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        for x, y in raw_boundary_points:
+            boundary_mask[y, x] = 255
+            
+        contours, _ = cv2.findContours(boundary_mask, 
+                                    cv2.RETR_EXTERNAL, 
+                                    cv2.CHAIN_APPROX_NONE)
+        
+        largest_contour = None
+        max_length = 0
+
+        for contour in contours:
+            length = len(contour)
+            if length > max_length:
+                max_length = length
+                largest_contour = contour
+                
+        ring_points_list = []
+        
+        if largest_contour is not None:
+            points_xy = largest_contour.reshape(-1, 2)
+            
+            for x, y in points_xy:
+                ring_points_list.append((x, y))
+
+        return ring_points_list
+    
     def is_goal_reachable(self, goal_msg):
         goal_future = self.client.send_goal_async(goal_msg)
         rclpy.spin_until_future_complete(self, goal_future)
@@ -129,6 +173,7 @@ class FrontierExplorer(Node):
 
         grid = np.array(self.latest_map_msg.data).reshape((h, w)) # If so, what is the point in this?
         self.frontiers = self.find_frontiers(grid)
+        self.ring_points = self._calculate_safety_ring_points(grid, upd)
         self.visualize_map(grid)
 
     def find_frontiers(self, grid):
@@ -251,9 +296,30 @@ class FrontierExplorer(Node):
         best_idx = int(np.argmax(combined))
 
         fx, fy, wx, wy, dist = viable[best_idx]
-        
-        #if not (self.compute_path(wx, wy)):
-        #    self.get_logger().info("######## Can't compute path ########")
+        min_ring_dist = float('inf')
+        closest_ring_world_coords = None
+
+       
+        for rx, ry in self.ring_points:
+           
+            rwx, rwy = self.map_to_world(rx, ry, map_msg)
+
+           
+            ring_dist = np.hypot(wx - rwx, wy - rwy)
+            
+
+            if ring_dist < min_ring_dist:
+                min_ring_dist = ring_dist
+                closest_ring_world_coords = (rwx, rwy)
+
+        if closest_ring_world_coords is None:
+            self.get_logger().warn("Safety ring is empty or calculation failed. Returning original frontier.")
+            closest_ring_world_coords = (wx, wy)
+
+
+        wx, wy = closest_ring_world_coords
+        fx, fy = self.world_to_map(wx, wy, map_msg)
+
         
         if (fx, fy) in self.frontiers:
             self.frontiers.remove((fx, fy))
@@ -280,19 +346,31 @@ class FrontierExplorer(Node):
     
 
     def visualize_map(self, grid):
+
         img = np.zeros((grid.shape[0], grid.shape[1], 3), dtype=np.uint8)
 
-        img[grid == -1] = [128, 128, 128]
-        img[grid == 0] = [255, 255, 255]
-        img[grid == 100] = [0, 0, 0]
-        img[(grid > 0) & (grid < 100)] = [50, 50, 50]
+        
+        img[grid == -1] = [128, 128, 128]   
+        img[grid == 0] = [255, 255, 255]   
+        img[grid == 100] = [0, 0, 0]       
+        img[(grid > 0) & (grid < 100)] = [50, 50, 50] 
+       
+        if self.latest_map_msg:
+            for mx, my in self.ring_points: 
+            
 
+                if 0 <= my < img.shape[0] and 0 <= mx < img.shape[1]:
+
+                    img[my, mx] = [0, 255, 255]
+
+        
         for fx, fy in self.frontiers:
-            img[fy, fx] = [0, 0, 255]
+            img[fy, fx] = [255, 0, 0]  
         for fx, fy in self.visited_frontiers:
-            img[fy, fx] = [0, 255, 0]  # green for visited
+            img[fy, fx] = [0, 255, 0] 
 
 
+     
         img = cv2.flip(img, 0)
         img_large = cv2.resize(img, None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST)
 

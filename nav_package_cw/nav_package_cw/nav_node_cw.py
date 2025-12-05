@@ -12,9 +12,10 @@ from rclpy.qos import qos_profile_sensor_data
 import math
 import numpy as np
 from action_msgs.msg import GoalStatus
+import random
 
 class NavigateToPoseActionClient(Node):
-    MOVE,SCAN,OBJECT,AVOID,DONE,TURNTO = range(6)
+    MOVE,SCAN,OBJECT,AVOID,DONE,TURNTO, RANDOM_WALK, RANDOM_TURN = range(8)
     def __init__(self):
         super().__init__('NavigateToPose_action_client')
         
@@ -48,7 +49,7 @@ class NavigateToPoseActionClient(Node):
             10
         )
         
-        self.state = self.SCAN
+        self.state = self.RANDOM_TURN
         self.timer_period = 0.5  # seconds
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
         self.timer_period_stuck = 10.0
@@ -68,10 +69,16 @@ class NavigateToPoseActionClient(Node):
         self.marker_counter = 0
         
         self.turn_spd = math.pi / 5.0
+        self.move_spd = 0.2
         self.turn_counter = 0.0
         self.distance_remaining = None
-        self.min_distance_to_object = 0.4
+        self.min_distance_to_object = 0.6
         self.min_wall_distance = 0.2
+        self.window_width = 0.2
+        
+        self.random_turn_angle = 0.0
+        self.random_walk_distance = 0.0
+        self.desired_distance = 0.5
         
         self.marker_pub = self.create_publisher(Marker, "/eye_target_marker", 10)
         self.Robot_point = self.create_publisher(PointStamped, '/robotpoint', 10)
@@ -97,7 +104,10 @@ class NavigateToPoseActionClient(Node):
         if self.prev_pos is None:
             self.prev_pos = (x, y)
             return
-
+        
+        if self.state == self.RANDOM_WALK or self.state == self.RANDOM_TURN:
+            self.state = self.MOVE
+        
         px, py = self.prev_pos
 
         # Euclidean distance moved since last check
@@ -113,12 +123,14 @@ class NavigateToPoseActionClient(Node):
             try:
                 if self.state == self.MOVE:
                     # cancel the goal (assuming you have nav2 action client named self.nav_client)
-                    self.cancel_navigation()
-                    if self.scan_points:
-                        self.scan_points.pop(0)
+                    self.state = self.RANDOM_WALK
+                    self.random_turn_angle = 0.0
+                    self.random_walk_distance = random.uniform(0.2, 1.5)
                 elif self.state == self.OBJECT:
-                    self.cancel_navigation()
-                    self.state = self.TURNTO
+                    self.state = self.RANDOM_WALK
+                    self.random_turn_angle = 0.0
+                    self.random_walk_distance = random.uniform(0.2, 1.5)
+    
             except Exception as e:
                 self.get_logger().error(f"Failed to cancel goal: {e}")
 
@@ -137,7 +149,7 @@ class NavigateToPoseActionClient(Node):
                 self.get_logger().error(f"Failed to calculate robots pose: {e}")
                 return None
     
-    def send_goala(self, x, y, z = 0.0): # This need's to be changed bro we can't just be slapping an A on it
+    def send_goala(self, x, y, z):
         
         self._action_client.wait_for_server()
 
@@ -237,8 +249,7 @@ class NavigateToPoseActionClient(Node):
 
     def get_result_callback(self, future):
         result = future.result().result  # Proper extraction of result object
-        if len(result.result.path.poses) == 0:
-            self.get_logger().log("invalid move")
+
         if result.result == 0: # Worked correctly
             if self.state == self.MOVE:
                 self.state = self.SCAN
@@ -277,7 +288,6 @@ class NavigateToPoseActionClient(Node):
         self.current_goal_handle = None
 
         self.get_logger().info("Finished :)")
-        result_msg = future.result().result      # the NavigateToPose::Result message
         status = future.result().status          # goal completion status
 
         # SUCCESS
@@ -314,7 +324,7 @@ class NavigateToPoseActionClient(Node):
     def feedback_callback(self, feedback_msg):
         #feedback = feedback_msg.feedback
         self.distance_remaining = feedback_msg.feedback.distance_remaining # Distance left to travel to goal/point
-        self.get_logger().info("Received feedback: " + str(self.distance_remaining))
+        #self.get_logger().info("Received feedback: " + str(self.distance_remaining))
 
         if feedback_msg.feedback.distance_remaining == float('inf'):
             self.get_logger().warn("Planner cannot find a valid path anymore!#############################")
@@ -360,7 +370,6 @@ class NavigateToPoseActionClient(Node):
 
     def avoid_turn(self,msg):
         if (self.can_move_foward(0.2, 0.3)): # Robots minimum cone of vision
-   
             self.stop(msg)
             if len(self.go_to_points) != 0:
                 self.state = self.OBJECT
@@ -368,6 +377,38 @@ class NavigateToPoseActionClient(Node):
                 self.state = self.MOVE
         else:
             msg.angular.z = self.turn_spd
+            
+    def random_forward(self, msg):
+        if (self.random_walk_distance > 0.0) and self.can_move_foward(self.window_width, self.desired_distance):
+            
+            dist_to_move = self.move_spd * self.timer_period
+            
+            if dist_to_move > self.random_walk_distance:
+                dist_to_move = self.random_walk_distance
+            
+            msg.linear.x = dist_to_move / self.timer_period
+            self.random_walk_distance -= dist_to_move
+            
+        else:
+            self.stop(msg)
+            self.random_walk_distance = 0.0
+            
+            random_angle_rad = random.uniform(math.pi / 4.0, math.pi * 0.9)
+            self.random_turn_angle = random_angle_rad 
+            
+            self.state = self.RANDOM_TURN
+    
+    def random_turn(self,msg):
+        angle_turned_per_cycle = self.turn_spd * self.timer_period 
+        
+        if self.random_turn_angle > 0.0:
+            msg.angular.z = self.turn_spd
+            self.random_turn_angle -= angle_turned_per_cycle
+        else:
+            self.stop(msg)
+            self.random_turn_angle = 0.0
+            self.random_walk_distance = random.uniform(0.2, 1.5)
+            self.state = self.RANDOM_WALK
     
     def timer_callback(self):
         msg = Twist()
@@ -375,9 +416,17 @@ class NavigateToPoseActionClient(Node):
         if self.state == self.MOVE:
             self.get_logger().info("STATE: MOVE")
 
+            # Object detected while moving = cancel nav & switch
+            if len(self.go_to_points) != 0:
+                self.get_logger().warn("Object detected = interrupting MOVE and switching to OBJECT")
+                self.cancel_navigation()
+                self.stop(msg)
+                self.state = self.OBJECT
+
             if self.is_navigating:
                 # Check if within 5cm of goal - consider it reached
                 if (self.distance_remaining is not None and self.distance_remaining <= 0.3):
+                    self.get_logger().info(f"Self.distance_remaining = {self.distance_remaining}")
                     self.get_logger().info("Within 5cm of MOVE goal = reached destination")
                     self.cancel_navigation()
                     self.stop(msg)
@@ -392,13 +441,6 @@ class NavigateToPoseActionClient(Node):
                     self.stop(msg)
                     self.state = self.AVOID
 
-                # Object detected while moving = cancel nav & switch
-                if len(self.go_to_points) != 0:
-                    self.get_logger().warn("Object detected = interrupting MOVE and switching to OBJECT")
-                    self.cancel_navigation()
-                    self.stop(msg)
-                    self.state = self.OBJECT
-
             else:
                 # No active navigation, so start a new goal
                 if len(self.scan_points) == 0:
@@ -412,12 +454,12 @@ class NavigateToPoseActionClient(Node):
                     point_msg.header.frame_id = "map"  # same frame as your TF
                     point_msg.point.x = float(x)
                     point_msg.point.y = float(y)
-                    point_msg.point.z = 0.0
+                    point_msg.point.z = 2.0
                     self.Robot_point.publish(point_msg) # The point the robots going to
                     return
                 
                 new_point = self.scan_points[0]
-                self.send_goala(new_point[0], new_point[1])
+                self.send_goala(new_point[0], new_point[1], 2.0)
                 self.is_navigating = True
 
         elif self.state == self.SCAN:
@@ -468,7 +510,7 @@ class NavigateToPoseActionClient(Node):
                     return
             else:
                 self.get_logger().info(f"Sending OBJECT goal to: {new_point}")
-                self.send_goala(new_point[0], new_point[1])
+                self.send_goala(new_point[0], new_point[1], new_point[2])
                 self.is_navigating = True
 
         elif self.state == self.AVOID:
@@ -516,7 +558,15 @@ class NavigateToPoseActionClient(Node):
 
             msg.angular.z = rot
             msg.linear.x = 0.0 # no forward movement
-
+            
+        elif self.state == self.RANDOM_WALK:
+            self.get_logger().info("STATE: RANDOM_WALK")
+            self.random_forward(msg) 
+        
+        elif self.state == self.RANDOM_TURN:
+            self.get_logger().info("STATE: RANDOM_TURN")
+            self.random_turn(msg)
+            
         self.publisher_twist.publish(msg)
 
     def scan_callback(self, msg):
