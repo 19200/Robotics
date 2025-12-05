@@ -73,16 +73,17 @@ class NavigateToPoseActionClient(Node):
         self.turn_counter = 0.0
         self.distance_remaining = None
         self.min_distance_to_object = 0.6
-        self.min_wall_distance = 0.2
+        self.min_wall_distance = 0.35
         self.window_width = 0.2
         
-        self.random_turn_angle = 0.0
+        self.random_turn_angle = 0.5
         self.random_walk_distance = 0.0
         self.desired_distance = 0.5
         
         self.marker_pub = self.create_publisher(Marker, "/eye_target_marker", 10)
         self.Robot_point = self.create_publisher(PointStamped, '/robotpoint', 10)
-        
+        self.prev_point = None
+        self.prev_object = None
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
@@ -107,6 +108,7 @@ class NavigateToPoseActionClient(Node):
         
         if self.state == self.RANDOM_WALK or self.state == self.RANDOM_TURN:
             self.state = self.MOVE
+            return
         
         px, py = self.prev_pos
 
@@ -122,14 +124,24 @@ class NavigateToPoseActionClient(Node):
 
             try:
                 if self.state == self.MOVE:
+                    if self.prev_point is not None:
+                        if self.prev_point == self.scan_points[0]:
+                            self.scan_points.pop(0)
+                    self.prev_point = self.scan_points[0]
                     # cancel the goal (assuming you have nav2 action client named self.nav_client)
                     self.state = self.RANDOM_WALK
                     self.random_turn_angle = 0.0
-                    self.random_walk_distance = random.uniform(0.2, 1.5)
+                    self.random_walk_distance = random.uniform(0.4, 1.5)
                 elif self.state == self.OBJECT:
+                    if self.prev_object is not None:
+                        if self.prev_object== self.go_to_points[0]:
+                            self.go_to_points.pop(0)
+                            
+                            
+                    self.prev_point = self.go_to_points[0]
                     self.state = self.RANDOM_WALK
                     self.random_turn_angle = 0.0
-                    self.random_walk_distance = random.uniform(0.2, 1.5)
+                    self.random_walk_distance = random.uniform(0.4, 1.5)
     
             except Exception as e:
                 self.get_logger().error(f"Failed to cancel goal: {e}")
@@ -379,6 +391,7 @@ class NavigateToPoseActionClient(Node):
             msg.angular.z = self.turn_spd
             
     def random_forward(self, msg):
+        self.get_logger().warn(f"Walk isbelow zero! ({self.random_walk_distance})")
         if (self.random_walk_distance > 0.0) and self.can_move_foward(self.window_width, self.desired_distance):
             
             dist_to_move = self.move_spd * self.timer_period
@@ -393,14 +406,15 @@ class NavigateToPoseActionClient(Node):
             self.stop(msg)
             self.random_walk_distance = 0.0
             
-            random_angle_rad = random.uniform(math.pi / 4.0, math.pi * 0.9)
+            random_angle_rad = random.uniform(math.pi / 2.0, math.pi * 0.9)
             self.random_turn_angle = random_angle_rad 
             
             self.state = self.RANDOM_TURN
     
     def random_turn(self,msg):
         angle_turned_per_cycle = self.turn_spd * self.timer_period 
-        
+        self.get_logger().warn(f"Angle dropped below zero! ({self.random_turn_angle})")
+
         if self.random_turn_angle > 0.0:
             msg.angular.z = self.turn_spd
             self.random_turn_angle -= angle_turned_per_cycle
@@ -422,10 +436,27 @@ class NavigateToPoseActionClient(Node):
                 self.cancel_navigation()
                 self.stop(msg)
                 self.state = self.OBJECT
+            if not self.can_move_foward(0.2, 0.3): # um chat, why these values again?
+                    self.get_logger().warn("Obstacle ahead = switching to AVOID")
+                    self.cancel_navigation()
+                    self.stop(msg)
+                    self.state = self.AVOID
 
             if self.is_navigating:
                 # Check if within 5cm of goal - consider it reached
-                if (self.distance_remaining is not None and self.distance_remaining <= 0.3):
+                pose = self.get_robot_pose()
+                if pose is None:
+                    self.get_logger().warn("Pose unavailable")
+                    dist = 200
+                    return
+                else:
+                    new_point = self.scan_points[0]
+                    x, y, yaw = pose
+                    x2 = new_point[0]
+                    y2 = new_point[1]
+                    
+                    dist = math.hypot(x2 - x, y2 - y)
+                if (self.distance_remaining is not None and (self.distance_remaining <= 0.4 or dist <= 0.5)):
                     self.get_logger().info(f"Self.distance_remaining = {self.distance_remaining}")
                     self.get_logger().info("Within 5cm of MOVE goal = reached destination")
                     self.cancel_navigation()
@@ -435,11 +466,7 @@ class NavigateToPoseActionClient(Node):
                     return
 
                 # Obstacle detected = switch to AVOID
-                if not self.can_move_foward(0.2, 0.3): # um chat, why these values again?
-                    self.get_logger().warn("Obstacle ahead = switching to AVOID")
-                    self.cancel_navigation()
-                    self.stop(msg)
-                    self.state = self.AVOID
+                
 
             else:
                 # No active navigation, so start a new goal
@@ -491,23 +518,36 @@ class NavigateToPoseActionClient(Node):
                 self.state = self.MOVE
                 return
 
+            if not self.can_move_foward(0.2, 0.3):
+                self.get_logger().warn("Obstacle while approaching object = switching to AVOID")
+                self.stop(msg)
+                self.state = self.AVOID
+
+            
             new_point = self.go_to_points[0]
 
             if self.is_navigating:
-                # Obstacle detected
-                if not self.can_move_foward(0.2, 0.3):
-                    self.get_logger().warn("Obstacle while approaching object = switching to AVOID")
-                    self.stop(msg)
-                    self.state = self.AVOID
-
-                # Close enough to object? - cant go forward -> stop movement -> set state to turn to face the object
-                if (self.distance_remaining is not None and self.distance_remaining <= self.min_distance_to_object):
-                    # Close enough = now face it first! You got it chat!
+                pose = self.get_robot_pose()
+                if pose is None:
+                    self.get_logger().warn("Pose unavailable")
+                    dist = 200
+                    return
+                else:
+                    new_point = self.scan_points[0]
+                    x, y, yaw = pose
+                    x2 = new_point[0]
+                    y2 = new_point[1]
+                    new_point = self.scan_points[0]
+                    dist = math.hypot(x2 - x, y2 - y)
+                if (self.distance_remaining is not None and (self.distance_remaining <= 0.4 or dist <= 0.5)):  # Close enough = now face it first! You got it chat!
                     self.get_logger().info("Close to object = switching to TURNTO for alignment")
                     self.cancel_navigation()
                     self.stop(msg)
                     self.state = self.TURNTO
                     return
+                # Obstacle detected
+               
+                   
             else:
                 self.get_logger().info(f"Sending OBJECT goal to: {new_point}")
                 self.send_goala(new_point[0], new_point[1], new_point[2])
@@ -549,7 +589,7 @@ class NavigateToPoseActionClient(Node):
                 self.publish_marker(obj_x, obj_y, obj_z)
                 self.get_logger().info("WE SHOULD NOW PUBLISH MARKER")
                 self.points_found.append(self.go_to_points.pop(0))
-                self.state = self.MOVE
+                self.state = self.AVOID
                 return
 
             k_p = 0.8 # proportional gain (turning sensitivity)

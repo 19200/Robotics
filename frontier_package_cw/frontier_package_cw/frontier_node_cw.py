@@ -316,7 +316,7 @@ class FrontierExplorer(Node):
             self.get_logger().warn("Safety ring is empty or calculation failed. Returning original frontier.")
             closest_ring_world_coords = (wx, wy)
 
-
+        # Update (fx, fy) and (wx, wy) to be the closest point on the safety ring
         wx, wy = closest_ring_world_coords
         fx, fy = self.world_to_map(wx, wy, map_msg)
 
