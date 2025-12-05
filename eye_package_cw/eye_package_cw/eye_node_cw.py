@@ -8,7 +8,7 @@ from cv_bridge import CvBridge
 from tf2_ros import TransformListener, Buffer
 from tf2_geometry_msgs import do_transform_point
 import numpy as np
-import cv2 
+import cv2
 import pyrealsense2 as rs
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker
@@ -41,24 +41,24 @@ def quaternion_to_rpy(q: Quaternion):
     return roll, pitch, yaw
 
 class ImageSubscriber(Node):
-    
+
     def __init__(self):
         super().__init__('image_subscriber')
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        
+
         self.subscription_image = self.create_subscription(
             Image,
             '/camera_depth/image_raw',
             self.image_callback,
             10)
-        
+
         self.subscription_dimage = self.create_subscription(
             Image,
             '/camera_depth/depth/image_raw',
             self.dimage_callback,
             10)
-        
+
         self.subscription_int = self.create_subscription(
             CameraInfo,
             '/camera_depth/camera_info',
@@ -70,75 +70,91 @@ class ImageSubscriber(Node):
             'odom',
             self.odom_callback,
             10)
-      
+
         self.ins = None
         self.image = None
         self.dimage = None
         self.Image_Publisher = self.create_publisher(PoseStamped, '/target_pose', 10)
         self.go_to_points = []
         self.br = CvBridge()
-        
+
         self.timer = self.create_timer(0.2, self.timer_callback)
-    
+
         self.marker_counter = 0
 
     def odom_callback(self, msg):
         self.location = (msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z)
         _, _, self.orientation = quaternion_to_rpy(msg.pose.pose.orientation)
-    
+
     def ins_callback(self, data):
         self.ins = data
-    
+
     def tf_from_cam_to_map(self):
         from_frame = 'camera_rgb_optical_frame'
         to_frame = 'map'
-        
+
         now = rclpy.time.Time()
-        
+
         try:
             tf = self.tf_buffer.lookup_transform(to_frame, from_frame, now, timeout=rclpy.duration.Duration(seconds=1.0))
             return tf
         except Exception as e:
             self.get_logger().error(f"Failed to get transformation: {e}")
             return None
-        
+
     def image_callback(self, data):
         #self.get_logger().info('Receiving video frame')
-    
+
         current_frame = self.br.imgmsg_to_cv2(data, desired_encoding='bgr8')
-        
+
         self.image = current_frame
-        
+
     def dimage_callback(self, data):
         #self.get_logger().info('Receiving dvideo frame')
-    
+
         current_frame = self.br.imgmsg_to_cv2(data, desired_encoding='passthrough')
-        
+
         self.dimage = current_frame
 
     def object_colour_detect(self, lower_bound, upper_bound, current_frame):
         centroids = [] #from the rgb image
         depths = [] #from the depth image (pixel of centroid)
-        
+
         hsv = cv2.cvtColor(current_frame, cv2.COLOR_BGR2HSV)
 
         # Do some vision processing here to get the centroids of any green objects
         # `centroids` should contain a list pixel points (x,y) for each green centroid
         # `depths' should contain a list of the corresponding depth at those pixel points
         # Do some vision processing here to get the centroids of any green objects
-        
+
         mask = cv2.inRange(hsv, lower_bound, upper_bound)
-        
+
         # Erosion and Dilution to get rid of little green bits
         kernel = np.ones((15, 15), np.uint8)
-        
+
         mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel) # advanced erosion
         mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel) # advanced dilution
-        
+
+        # Greyscale + blur
+        img_grey = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        img_blur = cv2.GaussianBlur(img_grey, (5, 5), 0)
+
+        masked_for_sobel = cv2.bitwise_and(img_blur, img_blur, mask=mask_clean)
+
+        sobel_x = cv2.Sobel(masked_for_sobel, cv2.CV_64F, 1, 0, ksize=5)
+        sobel_y = cv2.Sobel(masked_for_sobel, cv2.CV_64F, 0, 1, ksize=5)
+
+        gradient_magnitude = cv2.magnitude(sobel_x, sobel_y)
+        gradient_magnitude = cv2.convertScaleAbs(gradient_magnitude)
+
+        _, sobel_edges = cv2.threshold(gradient_magnitude, 127, 255, cv2.THRESH_BINARY)
+
+        combined = cv2.bitwise_or(mask_clean, sobel_edges)
+
         # Finding Midpoint
-        
-        contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+        # if it messes up change combined to mask_clean
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         for i in contours:
 
             area = cv2.contourArea(i)
@@ -149,14 +165,14 @@ class ImageSubscriber(Node):
             if M['m00'] != 0:
                 cx = int(M['m10']/M['m00'])
                 cy = int(M['m01']/M['m00'])
-                
+
                 centroids.append([cx, cy])
-                
+
                 cv2.drawContours(current_frame, [i], -1, (0, 255, 0), 2)
                 cv2.circle(current_frame, (cx, cy), 7, (0, 0, 255), -1)
                 cv2.putText(current_frame, "center", (cx - 20, cy - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-                
+
                 h, w = self.dimage.shape[:2]
                 if 0 <= cx < w and 0 <= cy < h:
                     depth_value = float(self.dimage[cy, cx])
@@ -172,7 +188,7 @@ class ImageSubscriber(Node):
                     depths.append(None)
                 else:
                     depths.append(depth_value)
-        
+
         result = cv2.bitwise_and(current_frame, current_frame, mask=mask_clean)
 
         if not centroids or not depths:
@@ -212,7 +228,7 @@ class ImageSubscriber(Node):
         _intrinsics.coeffs = [i for i in cameraInfo.d]
 
         points_3d = [rs.rs2_deproject_pixel_to_point(_intrinsics, centroids[x], depths[x]) for x in range(len(centroids))]
-        
+
         point = PointStamped()
         point.header.frame_id = 'camera_rgb_optical_frame'   # <-- FIXED
         point.header.stamp = self.get_clock().now().to_msg()
@@ -257,27 +273,27 @@ class ImageSubscriber(Node):
 
         if not isinstance(self.dimage, np.ndarray) or self.dimage.size == 0:
             return
-        
+
         current_frame = self.image
-        
+
         if current_frame == []:
             return
 
-        lower_green = np.array([45, 80, 30])
-        upper_green = np.array([80, 255, 255])
+        lower_green = np.array([36, 12, 6])
+        upper_green = np.array([90, 255, 255])
 
         lower_red = np.array([0, 120, 80])
         upper_red = np.array([8, 255, 255])
-        
+
         output_green = self.object_colour_detect(lower_green, upper_green, current_frame)
 
         if output_green is not None:
             result_g, point_world_g = output_green
             if point_world_g is not None and self.is_far_from_all_points(point_world_g.point.x,point_world_g.point.y):
                 self.go_to_points.append((point_world_g.point.x,point_world_g.point.y))
-                
+
                 pose = PoseStamped()
-                pose.header = point_world_g.header 
+                pose.header = point_world_g.header
 
                 pose.pose.position.x = point_world_g.point.x
                 pose.pose.position.y = point_world_g.point.y
@@ -292,9 +308,9 @@ class ImageSubscriber(Node):
             result_r, point_world_r = output_red
             if point_world_r is not None and self.is_far_from_all_points(point_world_r.point.x,point_world_r.point.y):
                 self.go_to_points.append((point_world_r.point.x,point_world_r.point.y))
-                
+
                 pose = PoseStamped()
-                pose.header = point_world_r.header 
+                pose.header = point_world_r.header
 
                 pose.pose.position.x = point_world_r.point.x
                 pose.pose.position.y = point_world_r.point.y
@@ -314,4 +330,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-    
