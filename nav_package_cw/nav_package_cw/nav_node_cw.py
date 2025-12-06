@@ -336,6 +336,7 @@ class NavigateToPoseActionClient(Node):
     def feedback_callback(self, feedback_msg):
         #feedback = feedback_msg.feedback
         self.distance_remaining = feedback_msg.feedback.distance_remaining # Distance left to travel to goal/point
+        
         #self.get_logger().info("Received feedback: " + str(self.distance_remaining))
 
         if feedback_msg.feedback.distance_remaining == float('inf'):
@@ -456,7 +457,7 @@ class NavigateToPoseActionClient(Node):
                     y2 = new_point[1]
                     
                     dist = math.hypot(x2 - x, y2 - y)
-                if (self.distance_remaining is not None and (self.distance_remaining <= 0.4 or dist <= 0.5)):
+                if (self.distance_remaining is not None and (self.distance_remaining <= 0.2 or dist <= 0.3)):
                     self.get_logger().info(f"Self.distance_remaining = {self.distance_remaining}")
                     self.get_logger().info("Within 5cm of MOVE goal = reached destination")
                     self.cancel_navigation()

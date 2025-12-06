@@ -199,7 +199,7 @@ class ImageSubscriber(Node):
         valid_depths = []
 
         for c, d in zip(centroids, depths):
-            if d is not None and d > 0:
+            if d is not None and d > 0 and d < 3.0:
                 valid_centroids.append(c)
                 valid_depths.append(d)
 

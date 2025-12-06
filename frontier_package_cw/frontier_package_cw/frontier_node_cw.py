@@ -58,7 +58,7 @@ class FrontierExplorer(Node):
         self.visited_frontiers = []
         self.ring_points =  []
         self.goal_distance_threshold = 1.0
- 
+        self.grid = None
         self.map_resolution = None
         self.map_origin_x = None
         self.map_origin_y = None
@@ -71,71 +71,80 @@ class FrontierExplorer(Node):
         self.map_origin_x = map_msg.info.origin.position.x
         self.map_origin_y = map_msg.info.origin.position.y
 
-        grid = np.array(map_msg.data).reshape((map_msg.info.height, map_msg.info.width)) # reshapes map when more points are discovered
-        self.frontiers = self.find_frontiers(grid) # includes frontiers
-        self.ring_points = self._calculate_safety_ring_points(grid, map_msg)
-        self.visualize_map(grid)
+        self.grid = np.array(map_msg.data).reshape((map_msg.info.height, map_msg.info.width)) # reshapes map when more points are discovered
+        self.frontiers = self.find_frontiers(self.grid) # includes frontiers
+        self.ring_points = self._calculate_safety_ring_points(self.grid, map_msg)
+        self.visualize_map(self.grid)
         
  
 
     def _calculate_safety_ring_points(self, grid, map_info):
- 
         h, w = grid.shape
-        
         obstacle_radius = 6 
-        
         initial_obstacle_binary = np.zeros((h, w), dtype=np.uint8)
         initial_obstacle_binary[grid != 0] = 255 
-        
         kernel_obs = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (obstacle_radius * 2 + 1, obstacle_radius * 2 + 1))
-        
         dilated_obstacle_map = cv2.dilate(initial_obstacle_binary, kernel_obs, iterations=1)
-
-        raw_boundary_points = []
         
+        # Invert: free space becomes 255, obstacles become 0
+        free_space_map = cv2.bitwise_not(dilated_obstacle_map)
+        
+        # Find all connected components in the free space
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(free_space_map, connectivity=8)
+        
+        # Find the largest connected component (excluding background label 0)
+        largest_area = 0
+        largest_label = 0
+        for label in range(1, num_labels):  # Skip label 0 (background)
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area > largest_area:
+                largest_area = area
+                largest_label = label
+        
+        # Create mask of only the largest free space region
+        largest_region_mask = np.zeros((h, w), dtype=np.uint8)
+        if largest_label > 0:
+            largest_region_mask[labels == largest_label] = 255
+        
+        # Find the boundary of this largest region
+        raw_boundary_points = []
         for y in range(1, h - 1):
             for x in range(1, w - 1):
-                
-                if dilated_obstacle_map[y, x] == 0: 
-                    
-                    is_adjacent_to_dilated_obstacle = False
-                    
+                if largest_region_mask[y, x] == 255:  # Point is in free space
+                    # Check if adjacent to obstacle or edge of region
+                    is_boundary = False
                     for dy, dx in [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]:
                         ny, nx = y + dy, x + dx
-                        
-                        if dilated_obstacle_map[ny, nx] == 255:
-                            is_adjacent_to_dilated_obstacle = True
-                            break 
-                    
-                    if is_adjacent_to_dilated_obstacle:
+                        if largest_region_mask[ny, nx] == 0:  # Adjacent to non-free space
+                            is_boundary = True
+                            break
+                    if is_boundary:
                         raw_boundary_points.append((x, y))
-
-        boundary_mask = np.zeros((h, w), dtype=np.uint8)
         
+        # Create boundary mask and extract contour
+        boundary_mask = np.zeros((h, w), dtype=np.uint8)
         for x, y in raw_boundary_points:
             boundary_mask[y, x] = 255
-            
-        contours, _ = cv2.findContours(boundary_mask, 
-                                    cv2.RETR_EXTERNAL, 
-                                    cv2.CHAIN_APPROX_NONE)
         
+        contours, _ = cv2.findContours(boundary_mask, 
+                                        cv2.RETR_EXTERNAL, 
+                                        cv2.CHAIN_APPROX_NONE)
+        
+        # Get the largest contour
         largest_contour = None
         max_length = 0
-
         for contour in contours:
             length = len(contour)
             if length > max_length:
                 max_length = length
                 largest_contour = contour
-                
-        ring_points_list = []
         
+        ring_points_list = []
         if largest_contour is not None:
             points_xy = largest_contour.reshape(-1, 2)
-            
             for x, y in points_xy:
                 ring_points_list.append((x, y))
-
+        
         return ring_points_list
     
     def is_goal_reachable(self, goal_msg):
@@ -161,40 +170,67 @@ class FrontierExplorer(Node):
     def map_update_callback(self, upd):
         if self.latest_map_msg is None:
             return
-
+        
         w = self.latest_map_msg.info.width
         h = self.latest_map_msg.info.height
-
+        
         for row in range(upd.height):
             for col in range(upd.width):
-                map_index = (upd.y + row) * w + (upd.x + col) # what is this doing? - is this just putting the 0, 1, -1 into the correct place when the map grows in size?
+                map_index = (upd.y + row) * w + (upd.x + col)  # Converts 2D coord to 1D array index
                 upd_index = row * upd.width + col
-                self.latest_map_msg.data[map_index] = upd.data[upd_index]
-
-        grid = np.array(self.latest_map_msg.data).reshape((h, w)) # If so, what is the point in this?
-        self.frontiers = self.find_frontiers(grid)
-        self.ring_points = self._calculate_safety_ring_points(grid, upd)
-        self.visualize_map(grid)
+                
+                # Get current value
+                current_val = self.latest_map_msg.data[map_index]
+                
+                # Only update if current value is NOT 0 (free space)
+                # Once a cell is known to be free, it stays free
+                if current_val != 0:
+                    self.latest_map_msg.data[map_index] = upd.data[upd_index]
+        
+        self.grid = np.array(self.latest_map_msg.data).reshape((h, w))  # Converts 1D array to 2D grid for processing
+        self.frontiers = self.find_frontiers(self.grid)
+        self.ring_points = self._calculate_safety_ring_points(self.grid, upd)
+        self.visualize_map(self.grid)
 
     def find_frontiers(self, grid):
         h, w = grid.shape
         frontiers = []
-
-        # Treat -1 as unknown
-        unknown_mask = grid < 0
-
+        
+        # Treat -1 as unknown (unexplored)
+        unknown_mask = grid == -1
+        
+        # Identify known obstacles (high occupancy probability)
+        # Typically > 50 means likely occupied, but adjust threshold as needed
+        obstacle_mask = grid > 50
+        
         for y in range(1, h - 1):
             for x in range(1, w - 1):
-
-                # Only free space
-                if grid[y, x] != 0:
+                # Only consider free space (0 or very low occupancy)
+                if grid[y, x] > 10 or grid[y, x] == -1:  # Not free enough
                     continue
                 
-                # If any neighbor is unknown = frontier
-                if np.any(unknown_mask[y-2:y+2, x-2:x+2]):
-                    if all((fx - x)**2 + (fy - y)**2 > 9 for fx, fy in frontiers): # Prevents frontiers from being duplicated, ensures a single line
-                        frontiers.append((x, y))
+                # Check if any neighbor is unknown = potential frontier
+                if not np.any(unknown_mask[y-2:y+3, x-2:x+3]):
+                    continue
+                
+                # Check if there's a known wall nearby (exclude if too close to obstacles)
+                if np.any(obstacle_mask[y-2:y+3, x-2:x+3]):
+                    continue
+                
+                has_valid_path_to_ring = False
+                for rx, ry in self.ring_points:
+                    if self.check_line_valid(x, y, rx, ry, grid):
+                        has_valid_path_to_ring = True
+                        break  # Stop once we find at least one valid path
+                
+                if not has_valid_path_to_ring:
+                    continue
 
+
+                # Prevents frontiers from being duplicated, ensures spacing
+                if all((fx - x)**2 + (fy - y)**2 > 9 for fx, fy in frontiers):
+                    frontiers.append((x, y))
+        
         return frontiers
 
     # Nuked has has_neigbor because it's never used 
@@ -285,8 +321,8 @@ class FrontierExplorer(Node):
         unknown_norm = [(u - min_u) / (max_u - min_u + 1e-6) for u in unknown_scores] # 1e-6 needed to not divide by 0
         dist_norm = [1.0 - (d - min_d) / (max_d - min_d + 1e-6) for d in dists]
         
-        W_unknown = 0.6 # weighted towards unknown
-        W_distance = 0.4 # more than distances
+        W_unknown = 1.0 # weighted towards unknown
+        W_distance = 1.0 # more than distances
 
         combined = [
             W_unknown * unknown_norm[i] - W_distance * dist_norm[i]
@@ -299,16 +335,16 @@ class FrontierExplorer(Node):
         min_ring_dist = float('inf')
         closest_ring_world_coords = None
 
-       
         for rx, ry in self.ring_points:
-           
             rwx, rwy = self.map_to_world(rx, ry, map_msg)
-
-           
             ring_dist = np.hypot(wx - rwx, wy - rwy)
             
-
-            if ring_dist < min_ring_dist:
+            # Check if line from current position to ring point passes through unknown cells
+            # Convert world coords back to grid coords for line checking
+            current_gx, current_gy = self.world_to_map(wx, wy, map_msg)
+            
+            # Check if the line is valid (doesn't pass through unknown cells)
+            if self.check_line_valid(current_gx, current_gy, rx, ry, self.grid) and ring_dist < min_ring_dist:
                 min_ring_dist = ring_dist
                 closest_ring_world_coords = (rwx, rwy)
 
@@ -327,6 +363,39 @@ class FrontierExplorer(Node):
         self.visited_frontiers.append((fx, fy))  
         self.visited_goals.append((wx, wy)) 
         return fx, fy
+
+    def check_line_valid(self, x0, y0, x1, y1, grid):## uses the brensenham algoruihtm from grapgics
+        """Check if line from (x0,y0) to (x1,y1) is valid (no unknown cells)"""
+        points = []
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        
+        x, y = x0, y0
+        while True:
+            # Check bounds
+            if not (0 <= y < grid.shape[0] and 0 <= x < grid.shape[1]):
+                return False
+            
+            # Check if cell is unknown
+            if grid[y, x] != 0:
+                return False
+            
+            if x == x1 and y == y1:
+                break
+                
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+        
+        return True
+
 
     def world_to_map(self, wx, wy, map_msg):
         res = map_msg.info.resolution
